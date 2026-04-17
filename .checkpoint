@@ -1,9 +1,9 @@
 {
   "version": 1,
   "slug": "railway-vs-vercel",
-  "step": "created",
-  "completed_specs": [],
-  "pending_specs": ["github-actions-railway-autonoma"],
+  "step": "deps_written",
+  "completed_specs": ["github-actions-railway-autonoma"],
+  "pending_specs": [],
   "created_at": "2026-04-17T00:00:00Z",
-  "updated_at": "2026-04-17T00:00:00Z"
+  "updated_at": "2026-04-17T00:00:01Z"
 }

@@ -1,0 +1,250 @@
+name: Railway E2E Tests
+
+# Runs end-to-end tests against a Railway deployment after the service
+# reports healthy. Surfaces pass/fail back to the PR as a status check.
+#
+# Required repository secrets:
+#   - RAILWAY_TOKEN       Personal or project token from railway.app/account/tokens
+#   - RAILWAY_SERVICE_ID  The Railway service ID to poll and resolve a URL for
+#   - AUTONOMA_API_KEY    API key from your Autonoma dashboard
+#
+# Optional repository variables:
+#   - AUTONOMA_SUITE_ID   The Autonoma test suite to run. If unset, the
+#                         default suite configured for the project is used.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: railway-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: Autonoma E2E against Railway
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: |
+          curl -fsSL https://railway.app/install.sh | sh
+          echo "$HOME/.railway/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve Railway service URL
+        id: railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RAILWAY_TOKEN:-}" ] || [ -z "${RAILWAY_SERVICE_ID:-}" ]; then
+            echo "::error::RAILWAY_TOKEN and RAILWAY_SERVICE_ID must be set."
+            exit 1
+          fi
+
+          query='query ServiceDomain($serviceId: String!) {
+            service(id: $serviceId) {
+              serviceInstances {
+                edges {
+                  node {
+                    domains {
+                      serviceDomains { domain }
+                      customDomains { domain }
+                    }
+                    latestDeployment { status }
+                  }
+                }
+              }
+            }
+          }'
+
+          payload=$(jq -n \
+            --arg query "$query" \
+            --arg serviceId "$RAILWAY_SERVICE_ID" \
+            '{query: $query, variables: {serviceId: $serviceId}}')
+
+          response=$(curl -sSf \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "$payload" \
+            https://backboard.railway.app/graphql/v2)
+
+          domain=$(echo "$response" | jq -r '
+            [.data.service.serviceInstances.edges[].node
+              | (.domains.customDomains[]?.domain, .domains.serviceDomains[]?.domain)]
+            | map(select(. != null and . != ""))
+            | first // ""')
+
+          if [ -z "$domain" ]; then
+            echo "::error::Could not resolve a domain for service $RAILWAY_SERVICE_ID."
+            echo "Response:"
+            echo "$response"
+            exit 1
+          fi
+
+          url="https://$domain"
+          echo "Resolved Railway URL: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Railway deployment to become healthy
+        env:
+          TARGET_URL: ${{ steps.railway.outputs.url }}
+        run: |
+          set -euo pipefail
+
+          max_attempts=60
+          sleep_seconds=10
+          attempt=1
+
+          while [ $attempt -le $max_attempts ]; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$TARGET_URL" || echo "000")
+            echo "Attempt $attempt/$max_attempts: HTTP $status"
+
+            if [ "$status" = "200" ] || [ "$status" = "204" ] || [ "$status" = "301" ] || [ "$status" = "302" ]; then
+              echo "Deployment is healthy."
+              exit 0
+            fi
+
+            attempt=$((attempt + 1))
+            sleep $sleep_seconds
+          done
+
+          echo "::error::Railway deployment at $TARGET_URL did not become healthy within $((max_attempts * sleep_seconds))s."
+          exit 1
+
+      - name: Trigger Autonoma E2E run
+        id: autonoma_trigger
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          AUTONOMA_SUITE_ID: ${{ vars.AUTONOMA_SUITE_ID }}
+          TARGET_URL: ${{ steps.railway.outputs.url }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${AUTONOMA_API_KEY:-}" ]; then
+            echo "::error::AUTONOMA_API_KEY is not set."
+            exit 1
+          fi
+
+          payload=$(jq -n \
+            --arg url "$TARGET_URL" \
+            --arg commit "$COMMIT_SHA" \
+            --arg suite "${AUTONOMA_SUITE_ID:-}" \
+            --arg pr "${PR_NUMBER:-}" \
+            '{
+              target_url: $url,
+              commit_sha: $commit,
+              suite_id: (if $suite == "" then null else $suite end),
+              metadata: {
+                source: "github-actions",
+                provider: "railway",
+                pr_number: (if $pr == "" then null else ($pr | tonumber) end)
+              }
+            }')
+
+          response=$(curl -sSf \
+            -H "Authorization: Bearer $AUTONOMA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            --data "$payload" \
+            https://api.getautonoma.com/v1/runs)
+
+          run_id=$(echo "$response" | jq -r '.id // .run_id // empty')
+
+          if [ -z "$run_id" ]; then
+            echo "::error::Autonoma API did not return a run id."
+            echo "Response:"
+            echo "$response"
+            exit 1
+          fi
+
+          echo "Triggered Autonoma run: $run_id"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Poll Autonoma run until complete
+        id: autonoma_poll
+        env:
+          AUTONOMA_API_KEY: ${{ secrets.AUTONOMA_API_KEY }}
+          RUN_ID: ${{ steps.autonoma_trigger.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          max_attempts=90
+          sleep_seconds=10
+          attempt=1
+
+          while [ $attempt -le $max_attempts ]; do
+            response=$(curl -sSf \
+              -H "Authorization: Bearer $AUTONOMA_API_KEY" \
+              "https://api.getautonoma.com/v1/runs/$RUN_ID")
+
+            status=$(echo "$response" | jq -r '.status // "unknown"')
+            echo "Attempt $attempt/$max_attempts: run $RUN_ID is $status"
+
+            case "$status" in
+              passed|succeeded|success)
+                echo "result=passed" >> "$GITHUB_OUTPUT"
+                echo "report_url=$(echo "$response" | jq -r '.report_url // empty')" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+              failed|errored|cancelled)
+                echo "result=$status" >> "$GITHUB_OUTPUT"
+                echo "report_url=$(echo "$response" | jq -r '.report_url // empty')" >> "$GITHUB_OUTPUT"
+                echo "::error::Autonoma run $RUN_ID finished with status: $status"
+                exit 1
+                ;;
+              queued|running|pending|in_progress)
+                ;;
+              *)
+                echo "Unknown status '$status', continuing to poll."
+                ;;
+            esac
+
+            attempt=$((attempt + 1))
+            sleep $sleep_seconds
+          done
+
+          echo "::error::Autonoma run $RUN_ID did not finish within $((max_attempts * sleep_seconds))s."
+          exit 1
+
+      - name: Comment result on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          RESULT: ${{ steps.autonoma_poll.outputs.result }}
+          REPORT_URL: ${{ steps.autonoma_poll.outputs.report_url }}
+          TARGET_URL: ${{ steps.railway.outputs.url }}
+        with:
+          script: |
+            const result = process.env.RESULT || 'unknown';
+            const reportUrl = process.env.REPORT_URL || '';
+            const targetUrl = process.env.TARGET_URL || '';
+            const emoji = result === 'passed' ? 'PASS' : 'FAIL';
+            const body = [
+              `**Autonoma E2E: ${emoji}** (${result})`,
+              ``,
+              `Target: ${targetUrl}`,
+              reportUrl ? `Report: ${reportUrl}` : ''
+            ].filter(Boolean).join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
